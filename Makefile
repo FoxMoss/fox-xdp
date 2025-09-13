@@ -6,7 +6,7 @@ KERN_OUT=build/kern.o
 CC=clang
 
 all:
-	$(CC) -g -Wall -target bpf -c $(KERNEL_SOURCES) -o $(KERN_OUT) 
+	$(CC) -O3 -g -Wall -target bpf -c $(KERNEL_SOURCES) -o $(KERN_OUT) 
 	$(CC) -O2 -g -Wall $(USER_SOURCES) -lbpf -lxdp -o build/user
 
 load:
