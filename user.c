@@ -41,7 +41,7 @@
 #define RX_BATCH_SIZE 64
 #define INVALID_UMEM_FRAME UINT64_MAX
 
-const char *ifname = "wlan0";
+const char *ifname = "lo";
 static int ifindex = -1;
 const char *prog_path = "build/kern.o";
 const char *prog_name = "prog";
@@ -201,26 +201,37 @@ error_exit:
   return NULL;
 }
 
-static void complete_tx(struct xsk_socket_info *xsk) {
+static void complete_tx(
+    struct xsk_socket_info *xsk) { // Initiate starting variables (completed
+                                   // amount and completion ring index).
   unsigned int completed;
   uint32_t idx_cq;
 
-  if (!xsk->outstanding_tx)
+  // If outstanding is below 1, it means we have no packets to TX.
+  if (!xsk->outstanding_tx) {
     return;
+  }
 
-  if (xsk_ring_prod__needs_wakeup(&xsk->tx))
+  // If we need to wakeup, execute syscall to wake up socket.
+  if (!(xsk_bind_flags & XDP_USE_NEED_WAKEUP) ||
+      xsk_ring_prod__needs_wakeup(&xsk->tx)) {
     sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+  }
 
-  /* Collect/free completed TX buffers */
+  // Try to free a bunch of frames on the completion ring.
   completed = xsk_ring_cons__peek(&xsk->umem->cq,
                                   XSK_RING_CONS__DEFAULT_NUM_DESCS, &idx_cq);
 
   if (completed > 0) {
-    for (int i = 0; i < completed; i++)
+    // Free frames and comp.
+    for (int i = 0; i < completed; i++) {
       xsk_free_umem_frame(xsk,
                           *xsk_ring_cons__comp_addr(&xsk->umem->cq, idx_cq++));
+    }
 
+    // Release "completed" frames.
     xsk_ring_cons__release(&xsk->umem->cq, completed);
+
     xsk->outstanding_tx -=
         completed < xsk->outstanding_tx ? completed : xsk->outstanding_tx;
   }
@@ -497,6 +508,69 @@ void get_mac_address(unsigned char *mac_addr, const char *ifname) {
   memcpy(mac_addr, ifr.ifr_hwaddr.sa_data, 6);
 }
 
+int af_xdp_send_packet(struct xsk_socket_info *xsk, void *pckt, uint16_t length,
+                       int new, uint64_t addr) {
+  // This represents the TX index.
+  uint32_t tx_idx = 0;
+  uint16_t amt;
+
+  // Retrieve the TX index from the TX ring to fill.
+  amt = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
+
+  if (amt != 1) {
+#ifdef DEBUG
+    fprintf(stdout, "[XSK]No TX slots available.\n");
+#endif
+
+    return 1;
+  }
+
+  unsigned int idx = 0;
+
+  // Retrieve index we want to insert at in UMEM and make sure it isn't
+  // equal/above to max number of frames.
+  idx = xsk->outstanding_tx;
+
+  // We must retrieve the next available address in the UMEM.
+  uint64_t addrat;
+
+  if (!new) {
+    addrat = addr;
+  } else {
+    // We must retrieve new address space.
+    addrat = xsk_alloc_umem_frame(xsk);
+
+    // We must copy our packet data to the UMEM area at the specific index (idx
+    // * frame size). We did this earlier.
+    memcpy(xsk_umem__get_data(xsk->umem->buffer, addrat), pckt, length);
+  }
+
+  // Retrieve TX descriptor at index.
+  struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&xsk->tx, tx_idx);
+
+  // Point the TX ring's frame address to what we have in the UMEM.
+  tx_desc->addr = addrat;
+
+  // Tell the TX ring the packet length.
+  tx_desc->len = length;
+
+  // Submit the TX batch to the producer ring.
+  xsk_ring_prod__submit(&xsk->tx, 1);
+
+  // Increase outstanding.
+  xsk->outstanding_tx++;
+
+#ifdef DEBUG
+  fprintf(stdout,
+          "Sending packet with length %u at location %llu. Outstanding count "
+          "=> %u.\n",
+          length, tx_desc->addr, xsk->outstanding_tx);
+#endif
+
+  // Return successful.
+  return 0;
+}
+
 int main(int argc, char **argv) {
   ifindex = if_nametoindex(ifname);
 
@@ -604,9 +678,79 @@ int main(int argc, char **argv) {
   get_mac_address(ingress.addr->sll_addr, ifname);
   ingress.addr->sll_halen = ETH_ALEN;
   ingress.addr->sll_ifindex = if_nametoindex(ifname);
+
+  struct pollfd fds[2];
+  int ret, nfds = 1;
+
+  memset(fds, 0, sizeof(fds));
+  fds[0].fd = xsk_socket__fd(xsk_socket->xsk);
+  fds[0].events = POLLIN;
   /* Start thread to do statistics display */
   /* Receive and count packets than drop them */
-  rx_and_process(&cfg, xsk_socket, &ingress);
+  while (1) {
+    ret = poll(fds, nfds, -1);
+
+    if (ret != 1) {
+      continue;
+    }
+
+    __u32 idx_rx = 0, idx_fq = 0;
+    unsigned int rcvd = 0;
+
+    rcvd = xsk_ring_cons__peek(&xsk_socket->rx, RX_BATCH_SIZE, &idx_rx);
+
+    if (!rcvd) {
+      continue;
+    }
+
+    int stock_frames = 0;
+
+    stock_frames = xsk_prod_nb_free(&xsk_socket->umem->fq,
+                                    xsk_umem_free_frames(xsk_socket));
+
+    if (stock_frames > 0) {
+      ret =
+          xsk_ring_prod__reserve(&xsk_socket->umem->fq, stock_frames, &idx_fq);
+
+      while (ret != stock_frames) {
+        ret = xsk_ring_prod__reserve(&xsk_socket->umem->fq, rcvd, &idx_fq);
+      }
+
+      for (int j = 0; j < stock_frames; j++) {
+        *xsk_ring_prod__fill_addr(&xsk_socket->umem->fq, idx_fq++) =
+            xsk_alloc_umem_frame(xsk_socket);
+      }
+
+      xsk_ring_prod__submit(&xsk_socket->umem->fq, stock_frames);
+    }
+
+    for (int j = 0; j < rcvd; j++) {
+      __u64 addr = xsk_ring_cons__rx_desc(&xsk_socket->rx, idx_rx)->addr;
+      __u32 len = xsk_ring_cons__rx_desc(&xsk_socket->rx, idx_rx++)->len;
+
+      void *pckt = xsk_umem__get_data(xsk_socket->umem->buffer, addr);
+
+      if (pckt == NULL) {
+#ifdef DEBUG
+        fprintf(stdout, "[XSK] Packet not true; freeing frame.\n");
+#endif
+
+        xsk_free_umem_frame(xsk_socket, addr);
+
+        continue;
+      }
+
+      unsigned char new_pckt_buff[2048];
+      memcpy(new_pckt_buff, pckt, 2048);
+
+      printf("packet attempted to send %i\n", 2048);
+      af_xdp_send_packet(xsk_socket, (void *)new_pckt_buff, 2048, 1, 0);
+    }
+
+    xsk_ring_cons__release(&xsk_socket->rx, rcvd);
+
+    complete_tx(xsk_socket);
+  }
 
   /* Cleanup */
   xsk_socket__delete(xsk_socket->xsk);
