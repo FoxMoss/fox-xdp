@@ -5,6 +5,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <sys/resource.h>
 #include <unistd.h>
@@ -119,18 +120,15 @@ xsk_configure_socket(struct xsk_umem_info *umem) {
     if (ret)
       goto error_exit;
   } else {
-    /* Getting the program ID must be after the xdp_socket__create() call */
     if (bpf_xdp_query_id(ifindex, 0, &prog_id))
       goto error_exit;
   }
 
-  /* Initialize umem frame allocation */
   for (i = 0; i < NUM_FRAMES; i++)
     xsk_info->umem_frame_addr[i] = i * FRAME_SIZE;
 
   xsk_info->umem_frame_free = NUM_FRAMES;
 
-  /* Stuff the receive path with buffers, we assume we have enough */
   ret = xsk_ring_prod__reserve(&xsk_info->umem->fq,
                                XSK_RING_PROD__DEFAULT_NUM_DESCS, &idx);
 
@@ -150,35 +148,29 @@ error_exit:
   return NULL;
 }
 
-static void complete_tx(
-    struct xsk_socket_info *xsk) { // Initiate starting variables (completed
-                                   // amount and completion ring index).
+static void complete_tx(struct xsk_socket_info *xsk) {
+
   unsigned int completed;
   uint32_t idx_cq;
 
-  // If outstanding is below 1, it means we have no packets to TX.
   if (!xsk->outstanding_tx) {
     return;
   }
 
-  // If we need to wakeup, execute syscall to wake up socket.
   if (!(xsk_bind_flags & XDP_USE_NEED_WAKEUP) ||
       xsk_ring_prod__needs_wakeup(&xsk->tx)) {
     sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
   }
 
-  // Try to free a bunch of frames on the completion ring.
   completed = xsk_ring_cons__peek(&xsk->umem->cq,
                                   XSK_RING_CONS__DEFAULT_NUM_DESCS, &idx_cq);
 
   if (completed > 0) {
-    // Free frames and comp.
     for (int i = 0; i < completed; i++) {
       xsk_free_umem_frame(xsk,
                           *xsk_ring_cons__comp_addr(&xsk->umem->cq, idx_cq++));
     }
 
-    // Release "completed" frames.
     xsk_ring_cons__release(&xsk->umem->cq, completed);
 
     xsk->outstanding_tx -=
@@ -186,7 +178,16 @@ static void complete_tx(
   }
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char *argv[]) {
+
+  if (argc != 2) {
+    fprintf(stderr, "Usage: %s [FILE]\n", argv[0]);
+    fprintf(stderr, "Block all incoming traffic with specific TLS hashes\n");
+    fprintf(stderr, "[FILE] Hash config file\n");
+    exit(EXIT_FAILURE);
+  }
+  char *config_file = argv[1];
+
   ifindex = if_nametoindex(ifname);
 
   void *packet_buffer;
@@ -249,7 +250,6 @@ int main(int argc, char **argv) {
     exit(EXIT_FAILURE);
   }
 
-  /* Open and configure the AF_XDP (xsk) socket */
   xsk_socket = xsk_configure_socket(umem);
   if (xsk_socket == NULL) {
     fprintf(stderr, "ERROR: Can't setup AF_XDP socket \"%s\"\n",
@@ -268,13 +268,29 @@ int main(int argc, char **argv) {
       bpf_object__find_map_by_name(xdp_program__bpf_obj(prog), "blocked");
   int blocked_map_fd = bpf_map__fd(blocked_map);
 
+  uint8_t block = BLOCK_NONE;
+
+  FILE *config_fd = fopen(config_file, "r");
+  if (config_fd == NULL) {
+    fprintf(stderr, "ERROR: Can't read config file. \"%s\"\n", strerror(errno));
+    exit(EXIT_FAILURE);
+  }
+
+  if (fread(&block, sizeof(uint8_t), 1, config_fd) != sizeof(uint8_t) &&
+      (block != BLOCK_BLACK || block != BLOCK_WHITE)) {
+    fprintf(stderr, "ERROR: Can't read block type. \"%s\"\n", strerror(errno));
+    exit(EXIT_FAILURE);
+  }
+
   uint32_t base_key = 0;
-  uint8_t block = BLOCK_BLACK;
   bpf_map_update_elem(blocked_map_fd, &base_key, &block, 0);
 
-  uint32_t curl = 712041247;
+  uint32_t hash = 1; // not zero in case it overides the blocktype
   uint8_t activate = HASH_ACTIVATE;
-  bpf_map_update_elem(blocked_map_fd, &curl, &activate, 0);
+  while (fread(&hash, sizeof(uint32_t), 1, config_fd) == sizeof(uint32_t)) {
+    bpf_map_update_elem(blocked_map_fd, &hash, &activate, 0);
+  }
+  fclose(config_fd);
 
   while (1) {
     ret = poll(fds, nfds, -1);

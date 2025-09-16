@@ -152,7 +152,8 @@ SEC("prog") int xdp_sock_prog(struct xdp_md *ctx) {
     if (!(((uint8_t *)start_payload)[0] == 0x16 &&
           ((uint8_t *)start_payload)[1] == 0x03 &&
           ((uint8_t *)start_payload)[2] == 0x01)) {
-      bpf_printk("not tls");
+      bpf_printk("not tls %i, %i, %i", ((uint8_t *)start_payload)[0],
+                 ((uint8_t *)start_payload)[1], ((uint8_t *)start_payload)[2]);
       return XDP_PASS;
     }
 
