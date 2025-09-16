@@ -1,4 +1,5 @@
 
+#include "shared.h"
 #include <arpa/inet.h>
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
@@ -41,14 +42,50 @@ struct __attribute__((__packed__)) tlshdr1 {
   uint16_t cyphercount;
 };
 
+#define CALCULATE_HASH(DATA, INDEX, LEN, REAL, REAL_END, MAYBE_MAX, OUT)       \
+  uint32_t OUT = 0;                                                            \
+  uint32_t INDEX = 0;                                                          \
+                                                                               \
+  bpf_for(INDEX, 0, MAYBE_MAX) {                                               \
+    if (INDEX >= LEN)                                                          \
+      break;                                                                   \
+    if (DATA + INDEX + 1 > REAL_END)                                           \
+      break;                                                                   \
+    uint8_t val;                                                               \
+                                                                               \
+    if (bpf_xdp_load_bytes(ctx, (long)(DATA - REAL + INDEX), &val, 1) < 0)     \
+      break;                                                                   \
+                                                                               \
+    OUT += val;                                                                \
+    OUT += OUT << 10;                                                          \
+    OUT ^= OUT >> 6;                                                           \
+  }                                                                            \
+  OUT += OUT << 3;                                                             \
+  OUT ^= OUT >> 11;                                                            \
+  OUT += OUT << 15;
+
 #define OVER(x, d) (x + 1 > (typeof(x))d)
 
+// struct {
+//   __uint(type, BPF_MAP_TYPE_XSKMAP);
+//   __type(key, __u32);
+//   __type(value, __u32);
+//   __uint(max_entries, 64);
+// } xsks_map SEC(".maps");
+//
 struct {
   __uint(type, BPF_MAP_TYPE_XSKMAP);
   __type(key, __u32);
   __type(value, __u32);
   __uint(max_entries, 64);
 } xsks_map SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __type(key, __u32);
+  __type(value, __u8);
+  __uint(max_entries, 64);
+} blocked SEC(".maps");
 
 // TODO: combat tcp splitting
 // struct {
@@ -59,7 +96,7 @@ struct {
 // } xdp_stats_map SEC(".maps");
 
 SEC("prog") int xdp_sock_prog(struct xdp_md *ctx) {
-  void *data = (void *)(long)ctx->data;
+  uint8_t *data = (void *)(long)ctx->data;
   void *data_end = (void *)(long)ctx->data_end;
 
   struct ethhdr *eth = data;
@@ -138,42 +175,96 @@ SEC("prog") int xdp_sock_prog(struct xdp_md *ctx) {
     }
 
     if (real_count <= 1) {
-      bpf_printk("cyphers too small\n");
+      bpf_printk("ciphers too small\n");
       return XDP_PASS;
     }
 
-    uint16_t *cyphers = (uint8_t *)tlsh + sizeof(struct tlshdr1);
+    uint8_t *ciphers = (uint8_t *)tlsh + sizeof(struct tlshdr1);
+    uint16_t *ciphers_16 = (uint8_t *)tlsh + sizeof(struct tlshdr1);
     //
-    if (OVER(cyphers, data_end)) {
-      bpf_printk("cyphers too small\n");
+    if (OVER(ciphers, data_end)) {
+      bpf_printk("ciphers too small\n");
+      return XDP_PASS;
+    }
+    if (OVER(ciphers_16, data_end)) {
+      bpf_printk("ciphers too small\n");
       return XDP_PASS;
     }
 
-    uint8_t *cyphers_end = (void *)cyphers + real_count;
-    if (OVER(cyphers_end, data_end)) {
-      bpf_printk("cyphers too small\n");
+    uint8_t *ciphers_end = (void *)ciphers + real_count;
+    if (OVER(ciphers_end, data_end)) {
+      bpf_printk("ciphers too small\n");
       return XDP_PASS;
     }
 
-    if (real_count != 60) {
-      bpf_printk("fail\n");
-      return XDP_DROP;
+    if (real_count > 800) {
+      bpf_printk("ciphers too big\n");
+      return XDP_PASS;
     }
 
-    if (OVER(cyphers + 30, data_end)) {
-      bpf_printk("fail\n");
-      return XDP_DROP;
+    uint32_t my_hash = 0;
+    uint32_t j = 0;
+    uint16_t lowest = 0;
+    bpf_for(j, 0, 700) {
+      if (j * 2 >= real_count)
+        break;
+
+      uint32_t i = 0;
+      uint16_t lowest_high = UINT16_MAX;
+      bpf_for(i, 0, 400) {
+        if (i * 2 >= real_count)
+          break;
+        uint16_t val = 0;
+
+        if (ciphers + i * 2 + 1 > data_end)
+          break;
+        if (bpf_xdp_load_bytes(ctx, (long)(ciphers - data + i * 2), &val, 2) <
+            0)
+          break;
+
+        if (val < lowest_high && val > lowest) {
+          lowest_high = val;
+        }
+      }
+
+      lowest = lowest_high;
+      bpf_printk("lowest %i", lowest);
+
+      my_hash += lowest;
+      my_hash += my_hash << 10;
+      my_hash ^= my_hash >> 6;
+    }
+    my_hash += my_hash << 3;
+    my_hash ^= my_hash >> 11;
+    my_hash += my_hash << 15;
+
+    bpf_printk("%u", my_hash);
+
+    uint32_t base_key = 0;
+    uint8_t *block_type = bpf_map_lookup_elem(&blocked, &base_key);
+
+    if (block_type == NULL) {
+      bpf_printk("passing no base");
+      return XDP_PASS;
     }
 
-    uint16_t cyphers_hashed = 41695;
-    uint16_t my_hash = 0;
-    for (size_t i = 0; i < 30; i++) {
-      my_hash ^= cyphers[i];
+    bpf_printk("block type %i", *block_type);
+
+    uint8_t *rec = bpf_map_lookup_elem(&blocked, &my_hash);
+
+    if (rec == NULL) {
+      if (*block_type == BLOCK_WHITE) {
+        return XDP_DROP;
+      }
+      bpf_printk("passing not on list");
+      return XDP_PASS;
     }
 
-    if (cyphers_hashed != my_hash) {
-      bpf_printk("fail\n");
-      return XDP_DROP;
+    if (*rec == HASH_ACTIVATE) {
+      bpf_printk("on list");
+      if (*block_type == BLOCK_BLACK) {
+        return XDP_DROP;
+      }
     }
 
     // }
