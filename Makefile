@@ -13,4 +13,4 @@ all:
 
 load:
 	-sudo xdp-loader unload -a $(NETWORK_DEVICE)
-	sudo ./build/user
+	sudo ./build/user build/conf

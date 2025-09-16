@@ -1,6 +1,9 @@
+#include "shared.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 // jenkins hash, fast but insecure
 uint32_t calculate_hash(uint16_t *data, size_t len) {
@@ -14,7 +17,6 @@ uint32_t calculate_hash(uint16_t *data, size_t len) {
       }
     }
     lowest = lowest_high;
-    printf("%i\n", lowest);
     hash += lowest;
     hash += hash << 10;
     hash ^= hash >> 6;
@@ -22,30 +24,47 @@ uint32_t calculate_hash(uint16_t *data, size_t len) {
   hash += hash << 3;
   hash ^= hash >> 11;
   hash += hash << 15;
-  printf("%u\n", hash);
   return hash;
 }
 
+void usage(char *argv[]) {
+  fprintf(stderr, "Usage: %s [OUTPUT] [BLOCKTYPE] [FILES]\n", argv[0]);
+  fprintf(stderr, "Hash the ciphers of a TLS packet.\n");
+  fprintf(stderr, "[OUTPUT] the file in which your hashes will be stored.\n");
+  fprintf(stderr, "[BLOCKTYPE] \"whitelist\" or \"blacklist\"\n");
+  fprintf(stderr, "[FILES] the ciphers feild of a tls packet.\n");
+  exit(0);
+}
+
 int main(int argc, char *argv[]) {
-  // from curl ja4
-  unsigned char curl[] = {
-      0x13, 0x2,  0x13, 0x3,  0x13, 0x1,  0xc0, 0x2c, 0xc0, 0x30, 0x0, 0x9f,
-      0xcc, 0xa9, 0xcc, 0xa8, 0xcc, 0xaa, 0xc0, 0x2b, 0xc0, 0x2f, 0x0, 0x9e,
-      0xc0, 0x24, 0xc0, 0x28, 0x0,  0x6b, 0xc0, 0x23, 0xc0, 0x27, 0x0, 0x67,
-      0xc0, 0xa,  0xc0, 0x14, 0x0,  0x39, 0xc0, 0x9,  0xc0, 0x13, 0x0, 0x33,
-      0x0,  0x9d, 0x0,  0x9c, 0x0,  0x3d, 0x0,  0x3c, 0x0,  0x35, 0x0, 0x2f};
+  if (argc < 4) {
+    usage(argv);
+  }
 
-  unsigned char chrome[] = {0x6a, 0x6a, 0x13, 0x1,  0x13, 0x2,  0x13, 0x3,
-                            0xc0, 0x2b, 0xc0, 0x2f, 0xc0, 0x2c, 0xc0, 0x30,
-                            0xcc, 0xa9, 0xcc, 0xa8, 0xc0, 0x13, 0xc0, 0x14,
-                            0x0,  0x9c, 0x0,  0x9d, 0x0,  0x2f, 0x0,  0x35};
+  uint8_t blocktype = BLOCK_NONE;
+  if (strcmp(argv[2], "whitelist") == 0) {
+    blocktype = BLOCK_WHITE;
+  } else if (strcmp(argv[2], "blacklist") == 0) {
+    blocktype = BLOCK_BLACK;
+  } else {
+    fprintf(stderr, "Error: BLOCKTYPE invalid\n\n");
+    usage(argv);
+  }
 
-  unsigned char firefox[] = {
-      0x13, 0x1,  0x13, 0x3,  0x13, 0x2,  0xc0, 0x2b, 0xc0, 0x2f, 0xcc, 0xa9,
-      0xcc, 0xa8, 0xc0, 0x2c, 0xc0, 0x30, 0xc0, 0xa,  0xc0, 0x9,  0xc0, 0x13,
-      0xc0, 0x14, 0x0,  0x9c, 0x0,  0x9d, 0x0,  0x2f, 0x0,  0x35};
+  FILE *output = fopen(argv[1], "w");
+  fwrite(&blocktype, sizeof(uint8_t), 1, output);
 
-  printf("curl %u\n", calculate_hash(curl, sizeof(curl) / 2));
-  printf("chrome %u\n", calculate_hash(chrome, sizeof(chrome) / 2));
-  printf("firefox %u\n", calculate_hash(firefox, sizeof(firefox) / 2));
+  for (size_t i = 3; i < argc; i++) {
+    FILE *f = fopen(argv[i], "r");
+    fseek(f, 0, SEEK_END);
+    size_t len = ftell(f);
+    uint8_t file[len];
+    fseek(f, 0, SEEK_SET);
+    fread(file, len, 1, f);
+    uint32_t hash = calculate_hash(file, len / 2);
+    printf("%s %u\n", argv[i], hash);
+
+    fwrite(&hash, sizeof(uint32_t), 1, output);
+  }
+  fclose(output);
 }
