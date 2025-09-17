@@ -4,9 +4,12 @@
 #include <net/if.h>
 #include <poll.h>
 #include <pthread.h>
+#include <signal.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/resource.h>
 #include <unistd.h>
 
@@ -19,10 +22,9 @@
 #define RX_BATCH_SIZE 64
 #define INVALID_UMEM_FRAME UINT64_MAX
 
-#define INTERFACE "lo"
+#define INTERFACE_SIZE 1024
 
-const char *ifname = INTERFACE;
-const char *block_map = "/sys/fs/bpf/" INTERFACE "/blocked";
+const char *ifname = "";
 static int ifindex = -1;
 const char *prog_path = "build/kern.o";
 const char *prog_name = "prog";
@@ -178,17 +180,36 @@ static void complete_tx(struct xsk_socket_info *xsk) {
   }
 }
 
+void unload() {
+  struct xdp_multiprog *multi_prog = xdp_multiprog__get_from_ifindex(ifindex);
+  if (multi_prog != NULL) {
+    if (!xdp_multiprog__detach(multi_prog))
+      printf("Unloaded BPF program\n");
+  }
+}
+
+void catch_close() {
+  unload();
+  exit(0);
+}
+
 int main(int argc, char *argv[]) {
 
-  if (argc != 2) {
-    fprintf(stderr, "Usage: %s [FILE]\n", argv[0]);
+  if (argc != 4) {
+    fprintf(stderr, "Usage: %s [FILE] [INTERFACE] [FILTER]\n", argv[0]);
     fprintf(stderr, "Block all incoming traffic with specific TLS hashes\n");
     fprintf(stderr, "[FILE] Hash config file\n");
+    fprintf(stderr, "[INTERFACE] Interface name (eg. wlan0, lo, etc)\n");
+    fprintf(stderr, "[FILTER] fox.bpf file\n");
     exit(EXIT_FAILURE);
   }
   char *config_file = argv[1];
+  ifname = argv[2];
 
   ifindex = if_nametoindex(ifname);
+  unload();
+
+  signal(SIGINT, catch_close);
 
   void *packet_buffer;
   uint64_t packet_buffer_size;
@@ -203,11 +224,11 @@ int main(int argc, char *argv[]) {
   struct bpf_map *map;
 
   custom_xsk = true;
-  xdp_opts.open_filename = prog_path;
+  xdp_opts.open_filename = argv[3];
   xdp_opts.prog_name = prog_name;
   xdp_opts.opts = &opts;
 
-  prog = xdp_program__open_file(prog_path, NULL, &opts);
+  prog = xdp_program__open_file(argv[3], NULL, &opts);
 
   err = libxdp_get_error(prog);
   if (err) {
@@ -276,21 +297,26 @@ int main(int argc, char *argv[]) {
     exit(EXIT_FAILURE);
   }
 
-  if (fread(&block, sizeof(uint8_t), 1, config_fd) != sizeof(uint8_t) &&
+  if (fread(&block, 1, sizeof(uint8_t), config_fd) != sizeof(uint8_t) &&
       (block != BLOCK_BLACK || block != BLOCK_WHITE)) {
     fprintf(stderr, "ERROR: Can't read block type. \"%s\"\n", strerror(errno));
     exit(EXIT_FAILURE);
   }
+  printf("Block type %i\n", block);
 
   uint32_t base_key = 0;
   bpf_map_update_elem(blocked_map_fd, &base_key, &block, 0);
 
   uint32_t hash = 1; // not zero in case it overides the blocktype
   uint8_t activate = HASH_ACTIVATE;
-  while (fread(&hash, sizeof(uint32_t), 1, config_fd) == sizeof(uint32_t)) {
+
+  while (fread(&hash, 1, sizeof(uint32_t), config_fd) == sizeof(uint32_t)) {
+    printf("Adding hash %u\n", hash);
     bpf_map_update_elem(blocked_map_fd, &hash, &activate, 0);
   }
   fclose(config_fd);
+
+  printf("Starting filtering!\n");
 
   while (1) {
     ret = poll(fds, nfds, -1);
@@ -355,6 +381,8 @@ int main(int argc, char *argv[]) {
 
   xsk_socket__delete(xsk_socket->xsk);
   xsk_umem__delete(umem->umem);
+
+  catch_close();
 
   return 1;
 }
