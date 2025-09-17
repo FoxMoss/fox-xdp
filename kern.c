@@ -66,12 +66,6 @@ struct __attribute__((__packed__)) tlshdr1 {
 
 #define OVER(x, d) (x + 1 > (typeof(x))d)
 
-// struct {
-//   __uint(type, BPF_MAP_TYPE_XSKMAP);
-//   __type(key, __u32);
-//   __type(value, __u32);
-//   __uint(max_entries, 64);
-// } xsks_map SEC(".maps");
 //
 struct {
   __uint(type, BPF_MAP_TYPE_XSKMAP);
@@ -101,9 +95,6 @@ SEC("prog") int xdp_sock_prog(struct xdp_md *ctx) {
 
   struct ethhdr *eth = data;
 
-  // if (!is_tcp(eth, data_end))
-  //   return XDP_PASS;
-
   struct iphdr *ip = (struct iphdr *)(eth + 1);
 
   if (OVER(ip, data_end))
@@ -112,71 +103,75 @@ SEC("prog") int xdp_sock_prog(struct xdp_md *ctx) {
   if (ip->ihl > 5)
     return XDP_PASS;
 
+#ifndef RELEASE
   bpf_printk("%pI4 -> %pI4 %i", &ip->saddr, &ip->daddr, ip->protocol);
+#endif
 
-  //
-  // if ((void *)ip + ip_hdr_len > data_end)
-  //   return XDP_PASS;
   if (ip->protocol == IPPROTO_TCP || ip->protocol == IPPROTO_IP) {
-
-    //
     struct tcphdr *tcp =
         (struct tcphdr *)((unsigned char *)ip + sizeof(struct iphdr));
 
     if (OVER(tcp, data_end))
       return XDP_PASS;
 
-    //
-    // if ((void *)(tcp + 1) > data_end)
-    //   return XDP_PASS;
-    //
-    //
-    // if ((void *)tcp + tcp_header_bytes > data_end)
-    //   return XDP_PASS;
-    //
-
+#ifndef RELEASE
     bpf_printk("D Off: %i", tcp->doff);
+#endif
 
     void *start_payload = ((uint8_t *)tcp) + (tcp->doff * 4);
 
     if (OVER(start_payload, data_end)) {
+#ifndef RELEASE
       bpf_printk("no payload\n");
+#endif
       return XDP_PASS;
     }
 
     if (OVER(start_payload + 120, data_end)) {
+#ifndef RELEASE
       bpf_printk("payload too small\n");
+#endif
       return XDP_PASS;
     }
 
     if (!(((uint8_t *)start_payload)[0] == 0x16 &&
           ((uint8_t *)start_payload)[1] == 0x03 &&
           ((uint8_t *)start_payload)[2] == 0x01)) {
+#ifndef RELEASE
       bpf_printk("not tls %i, %i, %i", ((uint8_t *)start_payload)[0],
                  ((uint8_t *)start_payload)[1], ((uint8_t *)start_payload)[2]);
+#endif
       return XDP_PASS;
     }
 
     struct tlshdr1 *tlsh = start_payload;
 
     if (OVER(tlsh, data_end)) {
+#ifndef RELEASE
       bpf_printk("tls to small\n");
+#endif
       return XDP_PASS;
     }
 
+#ifndef RELEASE
     bpf_printk("%i", tlsh->handshake);
     bpf_printk("%i", tlsh->session_id_length);
     bpf_printk("%i", bpf_ntohs(tlsh->cyphercount));
+#endif
     uint16_t real_count = bpf_ntohs(tlsh->cyphercount);
 
     if (tlsh->handshake != 1) {
 
+#ifndef RELEASE
       bpf_printk("not hello\n");
+#endif
       return XDP_PASS;
     }
 
     if (real_count <= 1) {
+#ifndef RELEASE
       bpf_printk("ciphers too small\n");
+#endif
       return XDP_PASS;
     }
 
@@ -184,22 +179,30 @@ SEC("prog") int xdp_sock_prog(struct xdp_md *ctx) {
     uint16_t *ciphers_16 = (uint8_t *)tlsh + sizeof(struct tlshdr1);
     //
     if (OVER(ciphers, data_end)) {
+#ifndef RELEASE
       bpf_printk("ciphers too small\n");
+#endif
       return XDP_PASS;
     }
     if (OVER(ciphers_16, data_end)) {
+#ifndef RELEASE
       bpf_printk("ciphers too small\n");
+#endif
       return XDP_PASS;
     }
 
     uint8_t *ciphers_end = (void *)ciphers + real_count;
     if (OVER(ciphers_end, data_end)) {
+#ifndef RELEASE
       bpf_printk("ciphers too small\n");
+#endif
       return XDP_PASS;
     }
 
     if (real_count > 800) {
+#ifndef RELEASE
       bpf_printk("ciphers too big\n");
+#endif
       return XDP_PASS;
     }
 
@@ -229,7 +232,9 @@ SEC("prog") int xdp_sock_prog(struct xdp_md *ctx) {
       }
 
       lowest = lowest_high;
+#ifndef RELEASE
       bpf_printk("lowest %i", lowest);
+#endif
 
       my_hash += lowest;
       my_hash += my_hash << 10;
@@ -239,17 +244,23 @@ SEC("prog") int xdp_sock_prog(struct xdp_md *ctx) {
     my_hash ^= my_hash >> 11;
     my_hash += my_hash << 15;
 
+#ifndef RELEASE
     bpf_printk("%u", my_hash);
+#endif
 
     uint32_t base_key = 0;
     uint8_t *block_type = bpf_map_lookup_elem(&blocked, &base_key);
 
     if (block_type == NULL) {
+#ifndef RELEASE
       bpf_printk("passing no base");
+#endif
       return XDP_PASS;
     }
 
+#ifndef RELEASE
     bpf_printk("block type %i", *block_type);
+#endif
 
     uint8_t *rec = bpf_map_lookup_elem(&blocked, &my_hash);
 
@@ -257,26 +268,24 @@ SEC("prog") int xdp_sock_prog(struct xdp_md *ctx) {
       if (*block_type == BLOCK_WHITE) {
         return XDP_DROP;
       }
+#ifndef RELEASE
       bpf_printk("passing not on list");
+#endif
       return XDP_PASS;
     }
 
     if (*rec == HASH_ACTIVATE) {
+#ifndef RELEASE
       bpf_printk("on list");
+#endif
       if (*block_type == BLOCK_BLACK) {
         return XDP_DROP;
       }
     }
 
-    // }
-    // bpf_printk("payload exists\n%s", ((char *)start_payload));
-
-    // int index = ctx->rx_queue_index;
-    //
-
-    // if (bpf_map_lookup_elem(&xsks_map, &index))
-    //   return bpf_redirect_map(&xsks_map, index, 0);
+#ifndef RELEASE
     bpf_printk("passed\n");
+#endif
     return XDP_PASS;
   }
   return XDP_PASS;
