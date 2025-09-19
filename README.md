@@ -1,3 +1,7 @@
+# Fox High Speed TLS Signature Filtering
+
+High speed TLS based filtering able to run entirely in an eBPF filter.
+
 # Example Usage
 
 Generate a config file

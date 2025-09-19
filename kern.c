@@ -65,7 +65,7 @@ struct __attribute__((__packed__)) tlshdr1 {
   OUT += OUT << 15;
 
 #define OVER(x, d) (x + 1 > (typeof(x))d)
-
+//
 //
 struct {
   __uint(type, BPF_MAP_TYPE_XSKMAP);
@@ -80,6 +80,13 @@ struct {
   __type(value, __u8);
   __uint(max_entries, 64);
 } blocked SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __type(key, __u32);
+  __type(value, __u8);
+  __uint(max_entries, 64);
+} pass_hash SEC(".maps");
 
 // TODO: combat tcp splitting
 // struct {
@@ -176,15 +183,8 @@ SEC("prog") int xdp_sock_prog(struct xdp_md *ctx) {
     }
 
     uint8_t *ciphers = (uint8_t *)tlsh + sizeof(struct tlshdr1);
-    uint16_t *ciphers_16 = (uint8_t *)tlsh + sizeof(struct tlshdr1);
-    //
+
     if (OVER(ciphers, data_end)) {
-#ifndef RELEASE
-      bpf_printk("ciphers too small\n");
-#endif
-      return XDP_PASS;
-    }
-    if (OVER(ciphers_16, data_end)) {
 #ifndef RELEASE
       bpf_printk("ciphers too small\n");
 #endif
@@ -192,10 +192,7 @@ SEC("prog") int xdp_sock_prog(struct xdp_md *ctx) {
     }
 
     uint8_t *ciphers_end = (void *)ciphers + real_count;
-    if (OVER(ciphers_end, data_end)) {
-#ifndef RELEASE
-      bpf_printk("ciphers too small\n");
-#endif
+    if (OVER(ciphers_end, data_end) && ciphers > data) {
       return XDP_PASS;
     }
 
@@ -266,6 +263,7 @@ SEC("prog") int xdp_sock_prog(struct xdp_md *ctx) {
 
     if (rec == NULL) {
       if (*block_type == BLOCK_WHITE) {
+
         return XDP_DROP;
       }
 #ifndef RELEASE
@@ -278,7 +276,26 @@ SEC("prog") int xdp_sock_prog(struct xdp_md *ctx) {
 #ifndef RELEASE
       bpf_printk("on list");
 #endif
-      if (*block_type == BLOCK_BLACK) {
+      if (*block_type == BLOCK_LOG) {
+        uint8_t *passes = bpf_map_lookup_elem(&pass_hash, &my_hash);
+
+#ifndef RELEASE
+        bpf_printk("kept\n");
+#endif
+
+        if (passes == NULL || *passes == 0) {
+          return bpf_redirect_map(&xsks_map, 0, 0);
+        }
+
+        (*passes) -= 1;
+
+        bpf_map_update_elem(&pass_hash, &my_hash, passes, 0);
+
+#ifndef RELEASE
+        bpf_printk("skipped\n");
+#endif
+
+      } else if (*block_type == BLOCK_BLACK) {
         return XDP_DROP;
       }
     }
