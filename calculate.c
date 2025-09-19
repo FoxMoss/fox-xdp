@@ -31,7 +31,7 @@ void usage(char *argv[]) {
   fprintf(stderr, "Usage: %s [OUTPUT] [BLOCKTYPE] [FILES]\n", argv[0]);
   fprintf(stderr, "Hash the ciphers of a TLS packet.\n");
   fprintf(stderr, "[OUTPUT] the file in which your hashes will be stored.\n");
-  fprintf(stderr, "[BLOCKTYPE] \"whitelist\" or \"blacklist\"\n");
+  fprintf(stderr, "[BLOCKTYPE] \"whitelist\", \"blacklist\", or \"log\"\n");
   fprintf(stderr, "[FILES] the ciphers feild of a tls packet.\n");
   exit(0);
 }
@@ -46,6 +46,8 @@ int main(int argc, char *argv[]) {
     blocktype = BLOCK_WHITE;
   } else if (strcmp(argv[2], "blacklist") == 0) {
     blocktype = BLOCK_BLACK;
+  } else if (strcmp(argv[2], "log") == 0) {
+    blocktype = BLOCK_LOG;
   } else {
     fprintf(stderr, "Error: BLOCKTYPE invalid\n\n");
     usage(argv);

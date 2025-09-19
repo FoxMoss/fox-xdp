@@ -1,7 +1,11 @@
 #include "shared.h"
 #include <assert.h>
 #include <errno.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
 #include <net/if.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -20,6 +24,7 @@
 #define NUM_FRAMES 4096
 #define FRAME_SIZE XSK_UMEM__DEFAULT_FRAME_SIZE
 #define RX_BATCH_SIZE 64
+#define FQ_REFILL_MAX (RX_BATCH_SIZE * 2)
 #define INVALID_UMEM_FRAME UINT64_MAX
 
 #define INTERFACE_SIZE 1024
@@ -31,10 +36,10 @@ const char *prog_name = "prog";
 const __u16 xsk_bind_flags = 0;
 enum xdp_attach_mode attach_mode = XDP_MODE_UNSPEC;
 const int xsk_if_queue = 0;
+int pass_hash_map_fd;
 
 static struct xdp_program *prog;
 int xsk_map_fd;
-bool custom_xsk = false;
 
 struct xsk_umem_info {
   struct xsk_ring_prod fq;
@@ -111,20 +116,15 @@ xsk_configure_socket(struct xsk_umem_info *umem) {
   xsk_cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
   xsk_cfg.xdp_flags = 0;
   xsk_cfg.bind_flags = xsk_bind_flags;
-  xsk_cfg.libbpf_flags = (custom_xsk) ? XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD : 0;
+  xsk_cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
   ret = xsk_socket__create(&xsk_info->xsk, ifname, xsk_if_queue, umem->umem,
                            &xsk_info->rx, &xsk_info->tx, &xsk_cfg);
   if (ret)
     goto error_exit;
 
-  if (custom_xsk) {
-    ret = xsk_socket__update_xskmap(xsk_info->xsk, xsk_map_fd);
-    if (ret)
-      goto error_exit;
-  } else {
-    if (bpf_xdp_query_id(ifindex, 0, &prog_id))
-      goto error_exit;
-  }
+  ret = xsk_socket__update_xskmap(xsk_info->xsk, xsk_map_fd);
+  if (ret)
+    goto error_exit;
 
   for (i = 0; i < NUM_FRAMES; i++)
     xsk_info->umem_frame_addr[i] = i * FRAME_SIZE;
@@ -150,36 +150,6 @@ error_exit:
   return NULL;
 }
 
-static void complete_tx(struct xsk_socket_info *xsk) {
-
-  unsigned int completed;
-  uint32_t idx_cq;
-
-  if (!xsk->outstanding_tx) {
-    return;
-  }
-
-  if (!(xsk_bind_flags & XDP_USE_NEED_WAKEUP) ||
-      xsk_ring_prod__needs_wakeup(&xsk->tx)) {
-    sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
-  }
-
-  completed = xsk_ring_cons__peek(&xsk->umem->cq,
-                                  XSK_RING_CONS__DEFAULT_NUM_DESCS, &idx_cq);
-
-  if (completed > 0) {
-    for (int i = 0; i < completed; i++) {
-      xsk_free_umem_frame(xsk,
-                          *xsk_ring_cons__comp_addr(&xsk->umem->cq, idx_cq++));
-    }
-
-    xsk_ring_cons__release(&xsk->umem->cq, completed);
-
-    xsk->outstanding_tx -=
-        completed < xsk->outstanding_tx ? completed : xsk->outstanding_tx;
-  }
-}
-
 void unload() {
   struct xdp_multiprog *multi_prog = xdp_multiprog__get_from_ifindex(ifindex);
   if (multi_prog != NULL) {
@@ -191,6 +161,81 @@ void unload() {
 void catch_close() {
   unload();
   exit(0);
+}
+
+struct __attribute__((__packed__)) tlshdr1 {
+  uint8_t contenttype;
+
+  uint16_t ver1;
+
+  uint16_t length;
+  uint8_t handshake;
+  uint16_t handshake_length;
+  uint8_t handshake_length2;
+
+  uint16_t ver2;
+  uint8_t random[32];
+  uint8_t session_id_length;
+  uint8_t session_random[32];
+  uint16_t cyphercount;
+};
+
+#define OVER(x, d) (x + 1 > (typeof(x))d)
+
+uint32_t calculate_hash(uint16_t *data, size_t len) {
+  uint32_t hash = 0;
+  uint16_t lowest = 0;
+  for (size_t i = 0; i < len; i++) {
+    uint16_t lowest_high = UINT16_MAX;
+    for (size_t j = 0; j < len; j++) {
+      if (data[j] < lowest_high && data[j] > lowest) {
+        lowest_high = data[j];
+      }
+    }
+    lowest = lowest_high;
+    hash += lowest;
+    hash += hash << 10;
+    hash ^= hash >> 6;
+  }
+  hash += hash << 3;
+  hash ^= hash >> 11;
+  hash += hash << 15;
+  return hash;
+}
+
+void handle_packet(uint8_t *data, size_t len) {
+  void *data_end = data + len;
+
+  struct ethhdr *eth = data;
+
+  struct iphdr *ip = (struct iphdr *)(eth + 1);
+
+  struct tcphdr *tcp =
+      (struct tcphdr *)((unsigned char *)ip + sizeof(struct iphdr));
+
+  void *start_payload = ((uint8_t *)tcp) + (tcp->doff * 4);
+  struct tlshdr1 *tlsh = start_payload;
+
+  uint16_t real_count = ntohs(tlsh->cyphercount);
+
+  uint16_t *ciphers = (uint16_t *)(tlsh + 1);
+
+  uint8_t *ciphers_end = (void *)ciphers + real_count;
+
+  uint16_t lowest = 0;
+  uint32_t my_hash = calculate_hash(ciphers, real_count / 2);
+
+  uint8_t passed_count = 0;
+
+#ifdef PASS_LOG
+  if (0 == bpf_map_lookup_elem(pass_hash_map_fd, &my_hash, &passed_count)) {
+    passed_count = 0;
+  }
+  passed_count++;
+  bpf_map_update_elem(pass_hash_map_fd, &my_hash, &passed_count, 0);
+#endif
+
+  printf("Blocked request with hash %u\n", my_hash);
 }
 
 int main(int argc, char *argv[]) {
@@ -208,29 +253,17 @@ int main(int argc, char *argv[]) {
 
   ifindex = if_nametoindex(ifname);
   unload();
-
   signal(SIGINT, catch_close);
 
-  void *packet_buffer;
-  uint64_t packet_buffer_size;
   DECLARE_LIBBPF_OPTS(bpf_object_open_opts, opts);
   DECLARE_LIBXDP_OPTS(xdp_program_opts, xdp_opts, 0);
-  struct rlimit rlim = {RLIM_INFINITY, RLIM_INFINITY};
-  struct xsk_umem_info *umem;
-  struct xsk_socket_info *xsk_socket;
-  int err;
-  char errmsg[1024];
-
-  struct bpf_map *map;
-
-  custom_xsk = true;
   xdp_opts.open_filename = argv[3];
   xdp_opts.prog_name = prog_name;
   xdp_opts.opts = &opts;
-
   prog = xdp_program__open_file(argv[3], NULL, &opts);
 
-  err = libxdp_get_error(prog);
+  char errmsg[1024];
+  int err = libxdp_get_error(prog);
   if (err) {
     libxdp_strerror(err, errmsg, sizeof(errmsg));
     fprintf(stderr, "ERR: loading program: %s\n", errmsg);
@@ -245,33 +278,38 @@ int main(int argc, char *argv[]) {
     return err;
   }
 
-  map = bpf_object__find_map_by_name(xdp_program__bpf_obj(prog), "xsks_map");
-  xsk_map_fd = bpf_map__fd(map);
+  struct bpf_map *socket_map;
+  socket_map =
+      bpf_object__find_map_by_name(xdp_program__bpf_obj(prog), "xsks_map");
+  xsk_map_fd = bpf_map__fd(socket_map);
   if (xsk_map_fd < 0) {
     fprintf(stderr, "ERROR: no xsks map found: %s\n", strerror(xsk_map_fd));
     exit(EXIT_FAILURE);
   }
 
+  struct rlimit rlim = {RLIM_INFINITY, RLIM_INFINITY};
   if (setrlimit(RLIMIT_MEMLOCK, &rlim)) {
     fprintf(stderr, "ERROR: setrlimit(RLIMIT_MEMLOCK) \"%s\"\n",
             strerror(errno));
     exit(EXIT_FAILURE);
   }
 
-  packet_buffer_size = NUM_FRAMES * FRAME_SIZE;
+  uint64_t packet_buffer_size = NUM_FRAMES * FRAME_SIZE;
+  void *packet_buffer;
   if (posix_memalign(&packet_buffer, getpagesize(), packet_buffer_size)) {
     fprintf(stderr, "ERROR: Can't allocate buffer memory \"%s\"\n",
             strerror(errno));
     exit(EXIT_FAILURE);
   }
 
-  umem = configure_xsk_umem(packet_buffer, packet_buffer_size);
+  struct xsk_umem_info *umem =
+      configure_xsk_umem(packet_buffer, packet_buffer_size);
   if (umem == NULL) {
     fprintf(stderr, "ERROR: Can't create umem \"%s\"\n", strerror(errno));
     exit(EXIT_FAILURE);
   }
 
-  xsk_socket = xsk_configure_socket(umem);
+  struct xsk_socket_info *xsk_socket = xsk_configure_socket(umem);
   if (xsk_socket == NULL) {
     fprintf(stderr, "ERROR: Can't setup AF_XDP socket \"%s\"\n",
             strerror(errno));
@@ -307,6 +345,10 @@ int main(int argc, char *argv[]) {
   uint32_t base_key = 0;
   bpf_map_update_elem(blocked_map_fd, &base_key, &block, 0);
 
+  struct bpf_map *pass_hash_map =
+      bpf_object__find_map_by_name(xdp_program__bpf_obj(prog), "pass_hash");
+  pass_hash_map_fd = bpf_map__fd(pass_hash_map);
+
   uint32_t hash = 1; // not zero in case it overides the blocktype
   uint8_t activate = HASH_ACTIVATE;
 
@@ -321,68 +363,84 @@ int main(int argc, char *argv[]) {
   while (1) {
     ret = poll(fds, nfds, -1);
 
-    if (ret != 1) {
-      continue;
-    }
+    uint32_t idx_rx;
+    int rcvd = xsk_ring_cons__peek(&xsk_socket->rx, RX_BATCH_SIZE, &idx_rx);
 
-    __u32 idx_rx = 0, idx_fq = 0;
-    unsigned int rcvd = 0;
+    uint32_t idx_fq;
+    int rsvd = xsk_ring_prod__reserve(&xsk_socket->umem->fq, rcvd, &idx_fq);
 
-    rcvd = xsk_ring_cons__peek(&xsk_socket->rx, RX_BATCH_SIZE, &idx_rx);
-
-    if (!rcvd) {
-      continue;
-    }
-
-    int stock_frames = 0;
-
-    stock_frames = xsk_prod_nb_free(&xsk_socket->umem->fq,
-                                    xsk_umem_free_frames(xsk_socket));
-
-    if (stock_frames > 0) {
-      ret =
-          xsk_ring_prod__reserve(&xsk_socket->umem->fq, stock_frames, &idx_fq);
-
-      while (ret != stock_frames) {
-        ret = xsk_ring_prod__reserve(&xsk_socket->umem->fq, rcvd, &idx_fq);
-      }
-
-      for (int j = 0; j < stock_frames; j++) {
-        *xsk_ring_prod__fill_addr(&xsk_socket->umem->fq, idx_fq++) =
-            xsk_alloc_umem_frame(xsk_socket);
-      }
-
-      xsk_ring_prod__submit(&xsk_socket->umem->fq, stock_frames);
-    }
-
-    for (int j = 0; j < rcvd; j++) {
-      __u64 addr = xsk_ring_cons__rx_desc(&xsk_socket->rx, idx_rx)->addr;
-
-      void *pckt = xsk_umem__get_data(xsk_socket->umem->buffer, addr);
-
-      if (pckt == NULL) {
-#ifdef DEBUG
-        fprintf(stdout, "[XSK] Packet not true; freeing frame.\n");
+#ifdef PASS_LOG
+    uint32_t tx_idx;
+    int txrsvd = xsk_ring_prod__reserve(&xsk_socket->tx, rcvd, &tx_idx);
 #endif
 
-        xsk_free_umem_frame(xsk_socket, addr);
-
-        continue;
-      }
-
-      unsigned char new_pckt_buff[2048];
-      memcpy(new_pckt_buff, pckt, 2048);
+    if (rsvd != rcvd) {
+      printf("Warning: Ring size mismatch %i %i\n", rcvd, rsvd);
+      continue;
     }
 
+    for (int i = 0; i < rcvd; i++) {
+      struct xdp_desc *rx_desc =
+          xsk_ring_cons__rx_desc(&xsk_socket->rx, idx_rx++);
+
+      char *packet =
+          xsk_umem__get_data(xsk_socket->umem->buffer, rx_desc->addr);
+
+#ifdef PASS_LOG
+      uint64_t tx_addr = xsk_alloc_umem_frame(xsk_socket);
+      if (tx_addr == INVALID_UMEM_FRAME) {
+        printf("whoops\n");
+        continue;
+      }
+      char *tx_packet = xsk_umem__get_data(xsk_socket->umem->buffer, tx_addr);
+      memcpy(tx_packet, packet, rx_desc->len);
+#endif
+
+      handle_packet(packet, rx_desc->len);
+
+#ifdef PASS_LOG
+      xsk_ring_prod__tx_desc(&xsk_socket->tx, tx_idx + i)->addr = tx_addr;
+      xsk_ring_prod__tx_desc(&xsk_socket->tx, tx_idx + i)->len = rx_desc->len;
+
+      *xsk_ring_prod__fill_addr(&xsk_socket->umem->fq, idx_fq + i) =
+          rx_desc->addr;
+#endif
+    }
+
+    // xsk_ring_prod__submit(&xsk_socket->tx, rcvd);
+    xsk_ring_prod__submit(&xsk_socket->umem->fq, rcvd);
     xsk_ring_cons__release(&xsk_socket->rx, rcvd);
 
-    complete_tx(xsk_socket);
+#ifdef PASS_LOG
+    int s =
+        sendto(xsk_socket__fd(xsk_socket->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+    if (s < 0 && errno != EAGAIN) {
+      fprintf(stderr, "sendto() to kick TX ring failed: %s\n", strerror(errno));
+    }
+
+    uint32_t idx_cq;
+    int completed = xsk_ring_cons__peek(
+        &xsk_socket->umem->cq, XSK_RING_CONS__DEFAULT_NUM_DESCS, &idx_cq);
+
+    if (completed > 0) {
+      for (int i = 0; i < completed; i++) {
+        uint64_t addr;
+
+        addr = *xsk_ring_cons__comp_addr(&xsk_socket->umem->cq, idx_cq++);
+        xsk_free_umem_frame(xsk_socket, addr);
+        // pr_addr_info(__func__, addr, xsk->umem);
+      }
+
+      xsk_ring_cons__release(&xsk_socket->umem->cq, completed);
+    }
   }
+#endif
+}
 
-  xsk_socket__delete(xsk_socket->xsk);
-  xsk_umem__delete(umem->umem);
+xsk_socket__delete(xsk_socket->xsk);
+xsk_umem__delete(umem->umem);
 
-  catch_close();
+catch_close();
 
-  return 1;
+return 1;
 }
