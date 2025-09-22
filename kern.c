@@ -212,7 +212,7 @@ SEC("prog") int xdp_sock_prog(struct xdp_md *ctx) {
 
       uint32_t i = 0;
       uint16_t lowest_high = UINT16_MAX;
-      bpf_for(i, 0, 400) {
+      bpf_for(i, 0, 700) {
         if (i * 2 >= real_count)
           break;
         uint16_t val = 0;
