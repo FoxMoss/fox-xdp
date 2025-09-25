@@ -1,0 +1,18 @@
+[package]
+name = "fox-xdp-benchmark"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hyper = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full"] }
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["full"] }
+tokio-rustls = "0.26.3"
+argh = "0.1.13"
+webpki-roots = "1.0.2"
+charming = "0.6.0"
+
+[features]
+
+default = ["charming/ssr-raster"]
