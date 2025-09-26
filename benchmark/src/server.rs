@@ -1,48 +1,45 @@
+use std::collections::{VecDeque, vec_deque};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread::sleep;
 
+use charming::element::range;
 use charming::{Chart, component::Axis, component::Legend, element::AxisType, series::Line};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, SystemTime};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tokio_rustls::{TlsAcceptor, rustls};
 
-pub struct Stats {
-    pub request_count: u32,
-    pub timeline: Vec<Duration>,
-    pub started: SystemTime,
-}
+use crate::client::Stats;
 
-impl Stats {
-    pub fn new() -> Stats {
-        Stats {
-            request_count: 0,
-            timeline: vec![],
-            started: SystemTime::now(),
-        }
-    }
+#[derive(Clone)]
+pub enum Filter {
+    OneMillisecondsSlowDown,
+    None,
 }
-
 
 struct FingerprintMiddleware<IO>
 where
-    IO: AsyncRead + AsyncWrite+ Unpin,
+    IO: AsyncRead + AsyncWrite + Unpin,
 {
     outer_stream: IO,
     read_size: usize,
+    filter: Filter,
 }
 
 impl<IO> FingerprintMiddleware<IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
-    pub fn new(stream: IO) -> Self {
+    pub fn new(stream: IO, filter: Filter) -> Self {
         Self {
             outer_stream: stream,
             read_size: 0,
+            filter: filter,
         }
     }
 }
@@ -78,10 +75,6 @@ where
     ) -> std::task::Poll<Result<(), std::io::Error>> {
         let this = self.get_mut();
 
-
-        println!("{} bytes", this.read_size);
-
-
         let outer_stream = std::pin::Pin::new(&mut this.outer_stream);
         outer_stream.poll_shutdown(cx)
     }
@@ -113,6 +106,13 @@ where
         let outer_stream = std::pin::Pin::new(&mut this.outer_stream);
         let ret = outer_stream.poll_read(cx, buf);
 
+        match this.filter {
+            Filter::OneMillisecondsSlowDown => {
+                sleep(Duration::from_millis(1));
+            }
+            Filter::None => {}
+        }
+
         this.read_size += buf.filled().len();
 
         ret
@@ -120,9 +120,10 @@ where
 }
 
 pub fn chart_stats(stats: Vec<(Stats, String)>, buckets: u32, duration: u64) -> Option<Chart> {
-    let total_length = Duration::from_secs(duration);
+    let total_length = Duration::from_secs(duration*1.1);
 
     let mut names: Vec<String> = vec![];
+    let mut line_names: Vec<String> = vec![];
     for cap in 1..=buckets {
         let top = (total_length / buckets) * cap;
         names.push(format!("{}ms", top.as_millis()));
@@ -130,6 +131,8 @@ pub fn chart_stats(stats: Vec<(Stats, String)>, buckets: u32, duration: u64) -> 
 
     let mut displays: Vec<(Vec<i32>, String)> = vec![];
     for stat in &stats {
+        // println!("{}: {} or {}", stat.1, stat.0.request_count, stat.0.timeline.len());
+
         let mut display: Vec<i32> = vec![];
         for cap in 1..=buckets {
             let bottom = (total_length / buckets) * (cap - 1);
@@ -144,11 +147,12 @@ pub fn chart_stats(stats: Vec<(Stats, String)>, buckets: u32, duration: u64) -> 
             }
             display.push(sum);
         }
+        line_names.push(stat.1.clone());
         displays.push((display, stat.1.clone()));
     }
 
     let mut chart = Chart::new()
-        .legend(Legend::new().data(stats.iter().map(|val| {val.1.clone()}).collect()))
+        .legend(Legend::new().data(line_names))
         .x_axis(Axis::new().type_(AxisType::Category).data(names))
         .y_axis(Axis::new().type_(AxisType::Value));
 
@@ -167,17 +171,15 @@ pub enum Messages {
 pub async fn run_server(
     tx: Sender<Messages>,
     duration: u64,
-) -> Result<Stats, Box<dyn std::error::Error>> {
-    let mut stats = Stats::new();
+    filter: Option<Filter>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let started = SystemTime::now();
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
 
     let certs =
-        CertificateDer::pem_file_iter("./certs/cert.pem")?
-            .collect::<Result<Vec<_>, _>>()?;
-    let key = PrivateKeyDer::from_pem_file(
-        "./certs/cert.key.pem",
-    )?;
+        CertificateDer::pem_file_iter("./certs/cert.pem")?.collect::<Result<Vec<_>, _>>()?;
+    let key = PrivateKeyDer::from_pem_file("./certs/cert.key.pem")?;
 
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -190,31 +192,37 @@ pub async fn run_server(
     tx.send(Messages::ClientStart).expect("couldnt send");
 
     let mut done = false;
+
     while !done {
         let (stream, _) = listener.accept().await?;
         let acceptor = acceptor.clone();
 
-        let now = SystemTime::now();
-        let since_start = now
-            .duration_since(stats.started)
-            .expect("time should go forward");
+        {
+            let now = SystemTime::now();
+            let since_start = now.duration_since(started).expect("time should go forward");
 
-        stats.timeline.push(since_start);
-        stats.request_count += 1;
-
-        if since_start > Duration::from_secs(duration) {
-            done = true;
+            if since_start > Duration::from_secs(duration) {
+                done = true;
+            }
         }
 
+        let filter_clone = filter.clone();
+
         tokio::task::spawn(async move {
+            let middleware =
+                FingerprintMiddleware::new(stream, filter_clone.unwrap_or(Filter::None));
             let mut tls_stream = acceptor
-                .accept(stream)
+                .accept(middleware)
                 .await
                 .ok()
                 .expect("failed to accept tls");
 
-            let response = "OK!";
-            if let Err(error) = tls_stream.write(response.as_bytes()).await {
+            let mut buf: Vec<u8>= vec![0; 1024];
+                        if let Err(error) = tls_stream.read(&mut buf).await {
+                println!("TLS Error: {}", error)
+                        }
+
+            if let Err(error) = tls_stream.write(&mut buf).await {
                 println!("TLS Error: {}", error)
             }
 
@@ -222,5 +230,5 @@ pub async fn run_server(
         });
     }
     tx.send(Messages::ClientEnd).expect("couldnt send");
-    Ok(stats)
+    Ok(())
 }
