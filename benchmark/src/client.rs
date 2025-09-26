@@ -2,8 +2,8 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
 
 use http_body_util::Full;
@@ -26,10 +26,31 @@ use crate::server::Messages;
 
 static PERMITS: Semaphore = Semaphore::const_new(500);
 
-pub async fn run_client(rx: Receiver<Messages>) -> Result<(), Box<dyn std::error::Error>> {
+#[derive(Clone)]
+pub struct Stats {
+    pub request_count: u32,
+    pub timeline: Vec<Duration>,
+    pub started: SystemTime,
+}
+
+impl Stats {
+    pub fn new() -> Stats {
+        Stats {
+            request_count: 0,
+            timeline: vec![],
+            started: SystemTime::now(),
+        }
+    }
+}
+
+pub async fn run_client(
+    rx: Receiver<Messages>,
+) -> Result<Arc<Mutex<Stats>>, Box<dyn std::error::Error>> {
+    let stats = Arc::new(Mutex::new(Stats::new()));
+
     let message = rx.recv().expect("couldnt get sender");
     if message != Messages::ClientStart {
-        return Ok(());
+        return Ok(stats);
     }
 
     let mut root_cert_store = rustls::RootCertStore::empty();
@@ -43,12 +64,16 @@ pub async fn run_client(rx: Receiver<Messages>) -> Result<(), Box<dyn std::error
             .expect("adding cert failed");
     }
 
+    let mut id = 0;
     loop {
         if let Ok(val) = rx.try_recv() {
             if val == Messages::ClientEnd {
-                return Ok(());
+                return Ok(stats);
             }
         }
+
+        id += 1;
+        let stats = stats.clone();
         let root_store_clone = root_cert_store.clone();
         tokio::task::spawn(async move {
             let _permit = PERMITS.acquire().await.unwrap();
@@ -59,7 +84,7 @@ pub async fn run_client(rx: Receiver<Messages>) -> Result<(), Box<dyn std::error
 
             let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
             match TcpStream::connect(&addr).await {
-                Err(error) => {}
+                Err(_) => {}
                 Ok(stream) => {
                     let server_name: ServerName = "localhost".try_into().expect("invalid DNS name");
                     let mut tls_stream = connector
@@ -67,17 +92,30 @@ pub async fn run_client(rx: Receiver<Messages>) -> Result<(), Box<dyn std::error
                         .await
                         .expect("couldnt connect with tls");
 
-                    let content = "hello server";
-                    tls_stream
-                        .write_all(content.as_bytes())
-                        .await
-                        .expect("couldnt write");
+                    let content = format!("{}", id);
+                    if let Ok(_) = tls_stream.write_all(content.as_bytes()).await {
+                        let len = content.len();
+                        let mut buf: Vec<u8> = vec![0; len];
+                        tls_stream
+                            .read_exact(&mut buf)
+                            .await
+                            .expect("couldnt write");
+                        let mut stats = stats.lock().unwrap();
 
-                    let mut buf: [u8; 3] = [0; 3];
-                    tls_stream
-                        .read_exact(&mut buf)
-                        .await
-                        .expect("couldnt write");
+                        if content.as_bytes() != buf {
+                            println!("Datat does NOT match");
+                            return;
+                        }
+
+                        let now = SystemTime::now();
+
+                        let since_start = now
+                            .duration_since(stats.started)
+                            .expect("time should go forward");
+
+                        stats.timeline.push(since_start);
+                        stats.request_count += 1;
+                    }
                 }
             }
         });
