@@ -1,26 +1,14 @@
-use std::convert::Infallible;
-use std::error::Error;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
 
-use http_body_util::Full;
-use hyper::body::Bytes;
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper::{Request, Response};
-use hyper_util::rt::TokioIo;
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{
-    AsyncReadExt, AsyncWriteExt, copy, split, stdin as tokio_stdin, stdout as tokio_stdout,
-};
-use tokio::net::TcpListener;
+use rustls::pki_types::{CertificateDer, ServerName};
+use std::time::{Duration, SystemTime};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
-use tokio_rustls::{TlsAcceptor, TlsConnector, rustls};
+use tokio_rustls::{TlsConnector, rustls};
 
 use crate::server::Messages;
 
@@ -29,7 +17,7 @@ static PERMITS: Semaphore = Semaphore::const_new(500);
 #[derive(Clone)]
 pub struct Stats {
     pub request_count: u32,
-    pub timeline: Vec<Duration>,
+    pub timeline: Vec<u64>,
     pub started: SystemTime,
 }
 
@@ -45,8 +33,15 @@ impl Stats {
 
 pub async fn run_client(
     rx: Receiver<Messages>,
+    duration: u64,
+    buckets: u32,
 ) -> Result<Arc<Mutex<Stats>>, Box<dyn std::error::Error>> {
     let stats = Arc::new(Mutex::new(Stats::new()));
+    {
+        let mut stats = stats.lock().unwrap();
+        stats.timeline = vec![0; buckets.try_into().unwrap()];
+
+    }
 
     let message = rx.recv().expect("couldnt get sender");
     if message != Messages::ClientStart {
@@ -108,12 +103,22 @@ pub async fn run_client(
                         }
 
                         let now = SystemTime::now();
-
                         let since_start = now
                             .duration_since(stats.started)
-                            .expect("time should go forward");
+                            .expect("time should go forward")
+                            .as_millis() as f64;
 
-                        stats.timeline.push(since_start);
+                        let bucket_size = (duration as f64) * 1000.0;
+                        let time_loc = since_start / bucket_size;
+                        let mut time_index =
+                            (time_loc * (buckets as f64)).round() as usize;
+
+                        if time_index >= stats.timeline.len() {
+                            time_index = stats.timeline.len() - 1;
+                        }
+
+                        stats.timeline[time_index] += 1;
+                        println!("{}", time_index);
                         stats.request_count += 1;
                     }
                 }
