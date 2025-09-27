@@ -12,6 +12,7 @@ tokio-rustls = "0.26.3"
 argh = "0.1.13"
 webpki-roots = "1.0.2"
 charming = "0.6.0"
+sha256 = "1.6.0"
 
 [features]
 
