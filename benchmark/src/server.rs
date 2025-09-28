@@ -1,11 +1,11 @@
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::thread::sleep;
-use sha256::{digest, try_digest};
 use charming::{Chart, component::Axis, component::Legend, element::AxisType, series::Line};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use sha256::{digest, try_digest};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::mpsc::Sender;
+use std::thread::sleep;
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -69,6 +69,7 @@ pub enum Filter {
     OneMillisecondsSlowDown,
     JenkinsHash,
     Sha256Hash,
+    DropAll,
     None,
 }
 
@@ -157,8 +158,8 @@ where
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        let outer_stream = std::pin::Pin::new(&mut this.outer_stream);
-        let ret = outer_stream.poll_read(cx, buf);
+        let mut outer_stream = std::pin::Pin::new(&mut this.outer_stream);
+        let ret = outer_stream.as_mut().poll_read(cx, buf);
 
         match this.filter {
             Filter::OneMillisecondsSlowDown => {
@@ -219,6 +220,38 @@ where
                     }
                 }
             }
+            Filter::DropAll => {
+                                if this.hash.is_none() {
+                    this.data.append(&mut buf.filled().to_vec());
+                    if this.data.len() > 4 {
+                        let total_len = u16::from_be_bytes(
+                            this.data[3..=4].try_into().expect("failed to parse size"),
+                        );
+
+                        // we have all of our data!
+                        if this.data.len() >= total_len.into() {
+                            let mut cursor = 1 + 2 + 2 + 1 + 3 + 2 + 32 + 1 + 32; // cipher suites cursor
+                            let cipher_length: usize = u16::from_be_bytes(
+                                this.data[cursor..=(cursor + 1)]
+                                    .try_into()
+                                    .expect("failed to parse uint"),
+                            )
+                            .into();
+                            cursor += 2;
+                            let ciphers: Vec<u8> =
+                                this.data[cursor..=(cursor + cipher_length)].to_vec();
+                            let mut ciphers_16 = u8_vec_to_u16_vec(ciphers);
+
+                            ciphers_16.sort();
+
+                            this.hash = Some(calculate_hash(ciphers_16));
+
+                            return outer_stream.poll_shutdown(cx);
+                        }
+                    }
+                }
+
+            }
             Filter::None => {}
         }
 
@@ -241,7 +274,15 @@ pub fn chart_stats(stats: Vec<(Stats, String)>, buckets: u32, duration: u64) -> 
     let mut displays: Vec<(Vec<i32>, String)> = vec![];
     for stat in &stats {
         line_names.push(stat.1.clone());
-        displays.push((stat.0.timeline.clone().into_iter().map(|val| val.try_into().unwrap()).collect(), stat.1.clone()));
+        displays.push((
+            stat.0
+                .timeline
+                .clone()
+                .into_iter()
+                .map(|val| val.try_into().unwrap())
+                .collect(),
+            stat.1.clone(),
+        ));
     }
 
     let mut chart = Chart::new()

@@ -107,6 +107,7 @@ SEC("prog") int xdp_sock_prog(struct xdp_md *ctx) {
   if (OVER(ip, data_end))
     return XDP_PASS;
 
+  // routers often drop packets with ip extensions so why bother parsing
   if (ip->ihl > 5)
     return XDP_PASS;
 
@@ -206,13 +207,13 @@ SEC("prog") int xdp_sock_prog(struct xdp_md *ctx) {
     uint32_t my_hash = 0;
     uint32_t j = 0;
     uint16_t lowest = 0;
-    bpf_for(j, 0, 700) {
+    bpf_for(j, 0, 800) {
       if (j * 2 >= real_count)
         break;
 
       uint32_t i = 0;
       uint16_t lowest_high = UINT16_MAX;
-      bpf_for(i, 0, 700) {
+      bpf_for(i, 0, 800) {
         if (i * 2 >= real_count)
           break;
         uint16_t val = 0;
